@@ -127,6 +127,17 @@ public:
 		return 0;
 	}
 
+	void ClearErr() override {
+		// temp
+		file_handle->Close();  // if your DuckDBFile supports it
+	}
+
+	int Error() override {
+		// temp
+		return file_handle->CanSeek();  // or some internal error mapping
+	}
+
+
 private:
 	unique_ptr<FileHandle> file_handle = nullptr;
 	bool is_eof = false;
@@ -145,7 +156,7 @@ public:
 		return client_prefix + value;
 	}
 
-	VSIVirtualHandle *Open(const char *gdal_file_path, const char *access, bool set_error,
+	VSIVirtualHandleUniquePtr Open(const char *gdal_file_path, const char *access, bool set_error,
 	                       CSLConstList /*papszoptions */) override {
 
 		// Strip the prefix to get the real file path
@@ -193,7 +204,7 @@ public:
 
 		try {
 			auto file = fs.OpenFile(real_file_path, flags | FileCompressionType::AUTO_DETECT);
-			return new DuckDBFileHandle(std::move(file));
+			return VSIVirtualHandleUniquePtr(new DuckDBFileHandle(std::move(file)));
 
 		} catch (std::exception &ex) {
 
@@ -224,7 +235,7 @@ public:
 				return nullptr;
 			}
 
-			return handler->Open(real_file_path, access);
+			return VSIVirtualHandleUniquePtr(handler->Open(real_file_path, access));
 		}
 	}
 
@@ -294,7 +305,7 @@ public:
 		return 0;
 	}
 
-	bool IsLocal(const char *gdal_file_path) override {
+	bool IsLocal(const char *gdal_file_path) {
 		const auto real_file_path = StripPrefix(gdal_file_path);
 		return !FileSystem::IsRemoteFile(real_file_path);
 	}
@@ -371,7 +382,7 @@ public:
 		}
 	}
 
-	int Rename(const char *oldpath, const char *newpath) override {
+	int Rename(const char *oldpath, const char *newpath) {
 		auto &fs = FileSystem::GetFileSystem(context);
 		const auto real_old_path = StripPrefix(oldpath);
 		const auto real_new_path = StripPrefix(newpath);
