@@ -1,5 +1,6 @@
 #include "spatial/index/rtree/rtree_index_create_physical.hpp"
 #include "spatial/index/rtree/rtree_index.hpp"
+#include "spatial/index/rtree/rtree_module.hpp"
 #include "spatial/index/rtree/rtree_node.hpp"
 #include "spatial/util/managed_collection.hpp"
 
@@ -11,9 +12,11 @@
 #include "duckdb/storage/table_io_manager.hpp"
 #include "duckdb/parallel/base_pipeline_event.hpp"
 
+#include "duckdb/main/extension/extension_loader.hpp"
+
 namespace duckdb {
 
-unique_ptr<IndexBuildBindData> RtreeIndexBuildBind(IndexBuildBindInput &input) {
+unique_ptr<IndexBuildBindData> RTreeIndexBuildBind(IndexBuildBindInput &input) {
 	return nullptr;
 }
 
@@ -56,7 +59,7 @@ public:
 };
 
 // init global state
-unique_ptr<IndexBuildState> RtreeInitBuildState(IndexBuildInitStateInput &input) {
+unique_ptr<IndexBuildState> RTreeIndexInitBuildState(IndexBuildInitStateInput &input) {
 	auto gstate = make_uniq<RTreeIndexBuildState>(input.context);
 
 	// Create the index
@@ -76,29 +79,22 @@ unique_ptr<IndexBuildState> RtreeInitBuildState(IndexBuildInitStateInput &input)
 	return std::move(gstate);
 }
 
-class RtreeIndexBuildSinkState final : public IndexBuildSinkState {
-public:
-	unique_ptr<ColumnDataCollection> collection;
-	ColumnDataAppendState append_state;
-};
-
-// init local sink state
-unique_ptr<IndexBuildSinkState> RtreeInitSinkState(IndexBuildInitSinkInput &input) {
-	auto state = make_uniq<RtreeIndexBuildSinkState>();
-	// TODO: Get the type of the sink chunk somehow
-	vector<LogicalType> data_types = {input.data_types[0], LogicalType::ROW_TYPE};
-	state->collection = make_uniq<ColumnDataCollection>(BufferManager::GetBufferManager(input.context), data_types);
-	state->collection->InitializeAppend(state->append_state);
-	return std::move(state);
-}
-
+// For RTree, there is no local sink state
 //-------------------------------------------------------------
 // Sink
 //-------------------------------------------------------------
 
-void RtreeIndexBuildSink(ExecutionContext &context, DataChunk &chunk, OperatorSinkInput &input) {
-	auto &gstate = input.global_state.Cast<RTreeIndexBuildState>();
-	//
+void RTreeIndexBuildSink(IndexBuildSinkInput &state, DataChunk &key_chunk, DataChunk &row_chunk) {
+	auto &gstate = state.global_state->Cast<RTreeIndexBuildState>();
+
+	// TODO; do this yourself
+	DataChunk chunk;
+	chunk.InitializeEmpty({key_chunk.data[0].GetType(), row_chunk.data[0].GetType()});
+	chunk.data[0].Reference(key_chunk.data[0]);
+	chunk.data[1].Reference(row_chunk.data[0]);
+	chunk.SetCardinality(key_chunk.size());
+
+	// What to do with this?
 	// if (chunk.size() == 0) {
 	// 	return SinkResultType::NEED_MORE_INPUT;
 	// }
@@ -133,26 +129,27 @@ void RtreeIndexBuildSink(ExecutionContext &context, DataChunk &chunk, OperatorSi
 	// return SinkResultType::NEED_MORE_INPUT;
 }
 
+// For RTree, there is no combine
+
 // not really necessary, this is just the global state
 class RTreeIndexBuildWorkState final : public IndexBuildWorkState {
 public:
 	explicit RTreeIndexBuildWorkState(RTreeIndexBuildState &state) : state(state) {
 	}
-
 	RTreeIndexBuildState &state;
 };
 
 // not really necessary, this is just the global state
-unique_ptr<IndexBuildWorkState> RTreeInitWorkState(IndexBuildInitWorkInput &input) {
-	auto &gstate = input.global_state->Cast<RTreeIndexBuildState>();
-	auto lstate = make_uniq<RTreeIndexBuildWorkState>(gstate);
-	return std::move(lstate);
-}
 
 //-------------------------------------------------------------
 // RTree Construction
 //-------------------------------------------------------------
-bool IndexBuildWork(IndexBuildWorkInput &input){
+
+// For the RTree construction, there is no InitWorkState
+// Since it is single-threaded
+
+// Former ExecuteTask()
+bool RTreeIndexBuildWork(IndexBuildWorkInput &input){
 	auto &gstate = input.global_state->Cast<RTreeIndexBuildState>();
 	auto &tree = gstate.rtree->tree;
 
@@ -168,7 +165,7 @@ bool IndexBuildWork(IndexBuildWorkInput &input){
 
 			if (gstate.curr_layer_ptr->Count() == 1) {
 				// We are done!
-				break;
+				return false;
 			}
 
 			// Current layer size, divided by the node capacity (rounded up)
@@ -248,8 +245,15 @@ bool IndexBuildWork(IndexBuildWorkInput &input){
 		gstate.rtree_level++;
 
 		// todo, return true?
+		// keep working
 		return true;
 	}
+}
+
+// No Build Work Combine
+void RTreeIndexBuildWorkCombine(IndexBuildWorkCombineInput &input) {
+	auto &gstate = input.global_state->Cast<RTreeIndexBuildState>();
+	auto &tree = gstate.rtree->tree;
 
 	// Set the root node!
 	auto root = gstate.curr_layer_ptr->Fetch(0);
@@ -266,100 +270,53 @@ bool IndexBuildWork(IndexBuildWorkInput &input){
 		auto root_entry = gstate.curr_layer_ptr->Fetch(0);
 		tree->SetRoot(root_entry);
 	}
-
-	return true;
 }
-
-static void AddIndexToCatalog(ClientContext &context, CreateRTreeIndexGlobalState &gstate, CreateIndexInfo &info,
-                              DuckTableEntry &table) {
-
-	// Now actually add the index to the storage
-	auto &storage = table.GetStorage();
-
-	if (!storage.IsRoot()) {
-		throw TransactionException("Cannot create index on non-root transaction");
-	}
-
-	// Create the index entry in the catalog
-	auto &schema = table.schema;
-
-	if (schema.GetEntry(schema.GetCatalogTransaction(context), CatalogType::INDEX_ENTRY, info.index_name)) {
-		if (info.on_conflict != OnCreateConflict::IGNORE_ON_CONFLICT) {
-			throw CatalogException("Index with name \"%s\" already exists", info.index_name);
-		}
-		// IF NOT EXISTS on existing index. We are done.
-		// TODO: Early out before this.
-		return;
-	}
-
-	const auto index_entry = schema.CreateIndex(schema.GetCatalogTransaction(context), info, table).get();
-	D_ASSERT(index_entry);
-	auto &duck_index = index_entry->Cast<DuckIndexEntry>();
-	duck_index.initial_index_size = gstate.rtree->Cast<BoundIndex>().GetInMemorySize();
-
-	// Finally add it to storage
-	storage.AddIndex(std::move(gstate.rtree));
-}
-
-class RTreeIndexConstructionEvent final : public BasePipelineEvent {
-public:
-	RTreeIndexConstructionEvent(CreateRTreeIndexGlobalState &gstate_p, Pipeline &pipeline_p, CreateIndexInfo &info_p,
-	                            DuckTableEntry &table_p, const PhysicalCreateRTreeIndex &op_p)
-	    : BasePipelineEvent(pipeline_p), gstate(gstate_p), info(info_p), table(table_p), op(op_p) {
-	}
-
-	void Schedule() override {
-		auto &context = pipeline->GetClientContext();
-
-		// We only schedule 1 task, as the bottom-up construction is single-threaded.
-		vector<shared_ptr<Task>> tasks;
-		tasks.push_back(make_uniq<RTreeIndexConstructionTask>(shared_from_this(), context, gstate, op));
-		SetTasks(std::move(tasks));
-	}
-
-	void FinishEvent() override {
-		AddIndexToCatalog(pipeline->GetClientContext(), gstate, info, table);
-	}
-
-private:
-	CreateRTreeIndexGlobalState &gstate;
-	CreateIndexInfo &info;
-	DuckTableEntry &table;
-	const PhysicalCreateRTreeIndex &op;
-};
+//
+// private:
+// 	RTreeIndexBuildState &gstate;
+// 	CreateIndexInfo &info;
+// 	DuckTableEntry &table;
+// 	const PhysicalCreateRTreeIndex &op;
+// };
 
 //-------------------------------------------------------------
 // Finalize
 //-------------------------------------------------------------
-SinkFinalizeType PhysicalCreateRTreeIndex::Finalize(Pipeline &pipeline, Event &event, ClientContext &context,
-                                                    OperatorSinkFinalizeInput &input) const {
-	auto &gstate = input.global_state.Cast<CreateRTreeIndexGlobalState>();
-	info->column_ids = storage_ids;
 
-	if (gstate.rtree_size == 0) {
-		// No entries to build the RTree from, we are done
-		AddIndexToCatalog(context, gstate, *info, table);
-		return SinkFinalizeType::READY;
-	}
-
-	// Otherwise, we need to build the RTree
-
-	// Calculate the vertical slice size
-	// square root of the total number of entries divide by the capacity of a node, rounded up
-	gstate.slice_size = ExactNumericCast<idx_t>(std::ceil(
-	                        std::sqrt((gstate.rtree_size + gstate.max_node_capacity - 1) / gstate.max_node_capacity))) *
-	                    gstate.max_node_capacity;
-
-	// Allocate a buffer for the vertical slice
-	// (this can get quite large, so we allocate it on the buffer manager)
-	gstate.slice_buffer =
-	    BufferManager::GetBufferManager(context).GetBufferAllocator().Allocate(gstate.slice_size * sizeof(RTreeEntry));
-
-	// Schedule the construction of the RTree
-	auto construction_event = make_uniq<RTreeIndexConstructionEvent>(gstate, pipeline, *info, table, *this);
-	event.InsertEvent(std::move(construction_event));
-
-	return SinkFinalizeType::READY;
+unique_ptr<BoundIndex> RTreeFinalizeBuild(IndexBuildFinalizeInput &input) {
+	auto &gstate = input.global_state.Cast<RTreeIndexBuildState>();
+	return std::move(gstate.rtree);
 }
+
+//------------------------------------------------------------------------------
+// Register Index Type
+//------------------------------------------------------------------------------
+void RTreeModule::RegisterIndex(ExtensionLoader &loader) {
+
+	IndexType index_type;
+
+	index_type.name = RTreeIndex::TYPE_NAME;
+	index_type.create_instance = RTreeIndex::Create;
+	// index_type.create_plan = RTreeIndex::CreatePlan;
+
+	index_type.build_bind = RTreeIndexBuildBind;
+	index_type.build_init = RTreeIndexInitBuildState;
+	// no sink init
+	index_type.build_sink = RTreeIndexBuildSink;
+	// no sink combine
+	// no prepare
+	// no work init (single thread)
+	index_type.build_work = RTreeIndexBuildWork;
+	index_type.build_work_combine = RTreeIndexBuildWorkCombine;
+	index_type.build_finalize = RTreeFinalizeBuild;
+	// no progress data
+
+
+	// Register the index type
+	auto &db = loader.GetDatabaseInstance();
+	auto &config = DBConfig::GetConfig(db);
+	config.GetIndexTypes().RegisterIndexType(index_type);
+}
+
 
 } // namespace duckdb

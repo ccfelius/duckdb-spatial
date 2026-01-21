@@ -304,20 +304,4 @@ void RTreeIndex::VerifyAllocations(IndexLock &state) {
 void RTreeIndex::VerifyBuffers(IndexLock &l) {
 }
 
-//------------------------------------------------------------------------------
-// Register Index Type
-//------------------------------------------------------------------------------
-void RTreeModule::RegisterIndex(ExtensionLoader &loader) {
-
-	IndexType index_type;
-
-	index_type.name = RTreeIndex::TYPE_NAME;
-	index_type.create_instance = RTreeIndex::Create;
-	index_type.create_plan = RTreeIndex::CreatePlan;
-
-	// Register the index type
-	auto &db = loader.GetDatabaseInstance();
-	db.config.GetIndexTypes().RegisterIndexType(index_type);
-}
-
 } // namespace duckdb
