@@ -3,6 +3,7 @@
 #include "spatial/index/rtree/rtree_module.hpp"
 #include "spatial/index/rtree/rtree_node.hpp"
 #include "spatial/util/managed_collection.hpp"
+#include "spatial/spatial_types.hpp"
 
 #include "duckdb/catalog/catalog_entry/duck_index_entry.hpp"
 #include "duckdb/catalog/catalog_entry/duck_table_entry.hpp"
@@ -17,7 +18,9 @@
 namespace duckdb {
 
 unique_ptr<IndexBuildBindData> RTreeIndexBuildBind(IndexBuildBindInput &input) {
-	return nullptr;
+	auto result = make_uniq<IndexBuildBindData>();
+	// result->query = "SELECT st_extent_approx(geom) as box, rowid FROM tbl;";
+	return result;
 }
 
 //-------------------------------------------------------------
@@ -58,6 +61,7 @@ public:
 	}
 };
 
+
 // init global state
 unique_ptr<IndexBuildState> RTreeIndexInitBuildState(IndexBuildInitStateInput &input) {
 	auto gstate = make_uniq<RTreeIndexBuildState>(input.context);
@@ -79,7 +83,15 @@ unique_ptr<IndexBuildState> RTreeIndexInitBuildState(IndexBuildInitStateInput &i
 	return std::move(gstate);
 }
 
-// For RTree, there is no local sink state
+// For RTree, there is not really a local sink state
+class RTreeIndexBuildSinkState final : public IndexBuildSinkState {
+};
+
+unique_ptr<IndexBuildSinkState> RTreeInitSinkState(IndexBuildInitSinkInput &input) {
+	auto state = make_uniq<RTreeIndexBuildSinkState>();
+	return std::move(state);
+}
+
 //-------------------------------------------------------------
 // Sink
 //-------------------------------------------------------------
@@ -87,23 +99,21 @@ unique_ptr<IndexBuildState> RTreeIndexInitBuildState(IndexBuildInitStateInput &i
 void RTreeIndexBuildSink(IndexBuildSinkInput &state, DataChunk &key_chunk, DataChunk &row_chunk) {
 	auto &gstate = state.global_state->Cast<RTreeIndexBuildState>();
 
-	// TODO; do this yourself
+	// What to do with this?
+	if (key_chunk.size() == 0) {
+		return;
+	}
+
+	// useless
 	DataChunk chunk;
 	chunk.InitializeEmpty({key_chunk.data[0].GetType(), row_chunk.data[0].GetType()});
 	chunk.data[0].Reference(key_chunk.data[0]);
 	chunk.data[1].Reference(row_chunk.data[0]);
 	chunk.SetCardinality(key_chunk.size());
 
-	// What to do with this?
-	// if (chunk.size() == 0) {
-	// 	return SinkResultType::NEED_MORE_INPUT;
-	// }
-
-	// TODO: Dont flatten chunk
-	chunk.Flatten();
 
 	const auto &bbox_vecs = StructVector::GetEntries(chunk.data[0]);
-	const auto &rowid_data = FlatVector::GetData<row_t>(chunk.data[1]);
+	const auto &rowid_data = FlatVector::GetData<row_t>(key_chunk.data[1]);
 	const auto min_x_data = FlatVector::GetData<float>(*bbox_vecs[0]);
 	const auto min_y_data = FlatVector::GetData<float>(*bbox_vecs[1]);
 	const auto max_x_data = FlatVector::GetData<float>(*bbox_vecs[2]);
@@ -111,7 +121,7 @@ void RTreeIndexBuildSink(IndexBuildSinkInput &state, DataChunk &key_chunk, DataC
 
 	// Vectorized conversion from columnar to row-wise
 	RTreeEntry entries[STANDARD_VECTOR_SIZE];
-	for (idx_t elem_idx = 0; elem_idx < chunk.size(); elem_idx++) {
+	for (idx_t elem_idx = 0; elem_idx < key_chunk.size(); elem_idx++) {
 		auto &entry = entries[elem_idx];
 		entry.pointer = RTree::MakeRowId(rowid_data[elem_idx]);
 		entry.bounds.min.x = min_x_data[elem_idx];
@@ -121,10 +131,10 @@ void RTreeIndexBuildSink(IndexBuildSinkInput &state, DataChunk &key_chunk, DataC
 	}
 
 	// Append the chunk to the current layer
-	gstate.curr_layer.Append(gstate.append_state, entries, entries + chunk.size());
+	gstate.curr_layer.Append(gstate.append_state, entries, entries + key_chunk.size());
 
 	// Count the number of entries
-	gstate.rtree_size += chunk.size();
+	gstate.rtree_size += key_chunk.size();
 
 	// return SinkResultType::NEED_MORE_INPUT;
 }
@@ -150,6 +160,7 @@ public:
 
 // Former ExecuteTask()
 bool RTreeIndexBuildWork(IndexBuildWorkInput &input){
+
 	auto &gstate = input.global_state->Cast<RTreeIndexBuildState>();
 	auto &tree = gstate.rtree->tree;
 
@@ -185,6 +196,7 @@ bool RTreeIndexBuildWork(IndexBuildWorkInput &input){
 		while (scan_count != 0) {
 			// Sort the slice by the bounding box y-min value
 			std::sort(slice_begin, slice_begin + scan_count, [&](const RTreeEntry &a, const RTreeEntry &b) {
+				// if true, keep working
 				return a.bounds.Center().y < b.bounds.Center().y;
 			});
 
@@ -240,20 +252,11 @@ bool RTreeIndexBuildWork(IndexBuildWorkInput &input){
 			gstate.next_layer_ptr->Append(gstate.append_state, RTreeEntry {current_ptr, node_bounds});
 			needs_insertion = false;
 		}
-
 		// We are done with this layer, pop it
 		gstate.rtree_level++;
-
-		// todo, return true?
 		// keep working
 		return true;
 	}
-}
-
-// No Build Work Combine
-void RTreeIndexBuildWorkCombine(IndexBuildWorkCombineInput &input) {
-	auto &gstate = input.global_state->Cast<RTreeIndexBuildState>();
-	auto &tree = gstate.rtree->tree;
 
 	// Set the root node!
 	auto root = gstate.curr_layer_ptr->Fetch(0);
@@ -270,7 +273,10 @@ void RTreeIndexBuildWorkCombine(IndexBuildWorkCombineInput &input) {
 		auto root_entry = gstate.curr_layer_ptr->Fetch(0);
 		tree->SetRoot(root_entry);
 	}
+
+	return false;
 }
+
 //
 // private:
 // 	RTreeIndexBuildState &gstate;
@@ -291,8 +297,8 @@ unique_ptr<BoundIndex> RTreeFinalizeBuild(IndexBuildFinalizeInput &input) {
 //------------------------------------------------------------------------------
 // Register Index Type
 //------------------------------------------------------------------------------
-void RTreeModule::RegisterIndex(ExtensionLoader &loader) {
 
+void RTreeModule::RegisterIndex(ExtensionLoader &loader) {
 	IndexType index_type;
 
 	index_type.name = RTreeIndex::TYPE_NAME;
@@ -302,15 +308,15 @@ void RTreeModule::RegisterIndex(ExtensionLoader &loader) {
 	index_type.build_bind = RTreeIndexBuildBind;
 	index_type.build_init = RTreeIndexInitBuildState;
 	// no sink init
+	index_type.build_sink_init = RTreeInitSinkState;
 	index_type.build_sink = RTreeIndexBuildSink;
 	// no sink combine
 	// no prepare
 	// no work init (single thread)
 	index_type.build_work = RTreeIndexBuildWork;
-	index_type.build_work_combine = RTreeIndexBuildWorkCombine;
+	// index_type.build_work_combine = RTreeIndexBuildWorkCombine;
 	index_type.build_finalize = RTreeFinalizeBuild;
 	// no progress data
-
 
 	// Register the index type
 	auto &db = loader.GetDatabaseInstance();

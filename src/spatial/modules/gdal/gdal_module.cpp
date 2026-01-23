@@ -4,6 +4,7 @@
 
 // DUCKDB
 #include "duckdb/main/extension/extension_loader.hpp"
+#include "duckdb/main/settings.hpp"
 #include "duckdb/function/copy_function.hpp"
 #include "duckdb/function/table/arrow.hpp"
 #include "duckdb/common/arrow/arrow_converter.hpp"
@@ -209,7 +210,7 @@ public:
 			}
 
 			// Fall back to GDAL instead (if external access is enabled)
-			if (!context.db->config.options.enable_external_access) {
+			if (!Settings::Get<EnableExternalAccessSetting>(context)) {
 				if (set_error) {
 					VSIError(VSIE_FileError, "%s", error_data.RawMessage().c_str());
 				}
@@ -410,7 +411,7 @@ public:
 	string AddPrefix(const string &value) const {
 		// If the user explicitly asked for a VSI prefix, we don't add our own
 		if (StringUtil::StartsWith(value, "/vsi")) {
-			if (!context.db->config.options.enable_external_access) {
+			if (!Settings::Get<EnableExternalAccessSetting>(context)) {
 				throw PermissionException("Cannot open file '%s' with VSI prefix: External access is disabled", value);
 			}
 			return value;
